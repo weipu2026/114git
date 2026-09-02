@@ -42,15 +42,16 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 2. 在 Cloudflare 拿到两样东西：
    - **账户 ID**：Workers 首页右侧可见。
    - **API Token**：右上角头像 → My Profile → API Tokens → 创建，权限选 **Workers Scripts — Edit**。
-3. GitHub 仓库 → Settings → Secrets and variables → Actions → 添加 **5 个 secret**（全在一处，方便管理）：
+3. GitHub 仓库 → Settings → Secrets and variables → Actions → 添加 **6 个 secret**（全在一处，方便管理）：
    - `CLOUDFLARE_ACCOUNT_ID`（账户 ID）
    - `CLOUDFLARE_API_TOKEN`（API Token，部署钥匙）
    - `PASSWORD`（登录密码）
    - `TOKEN_KEY`（令牌主密钥）
    - `DOMAIN`（你的反代域名，如 `git.abc.xyz`）
-4. 以后每次 `git push` 到 `main`，GitHub Actions 自动 `wrangler deploy`，并**自动把这三个运行配置（`PASSWORD` / `TOKEN_KEY` / `DOMAIN`）写入 Worker 机密**（wrangler-action 的 `secrets` 功能，等价 `wrangler secret put`，加密存储）。Cloudflare 那边**不需要手动配任何东西**。
+   - `ALLOW_MASTER_KEY`（`false` 或 `true`，二选一必填）
+4. 以后每次 `git push` 到 `main`，GitHub Actions **先校验必填配置**，再自动 `wrangler deploy`，把这四个运行配置（`PASSWORD` / `TOKEN_KEY` / `DOMAIN` / `ALLOW_MASTER_KEY`）写入 Worker 机密（wrangler-action 的 `secrets` 功能，等价 `wrangler secret put`，加密存储）。Cloudflare 那边**不需要手动配任何东西**。
 5. **改配置**（换密码/密钥/域名）：直接改对应 GitHub Secret 的值，然后到 Actions 页点「Run workflow」手动触发一次部署即同步。
-6. **fork 部署零代码修改**：全部配置集中在 GitHub Secrets，他人 fork 后只需填自己的一套 secret（5 个）即可使用，无需改动任何代码文件。
+6. **fork 部署零代码修改**：全部配置集中在 GitHub Secrets，他人 fork 后只需填自己的一套 secret（6 个）即可使用，无需改动任何代码文件。
 
 > 💡 **若忘了配 `PASSWORD` / `TOKEN_KEY`**：首次打开会显示「首次部署引导」页，5 步指引 + 「生成随机密钥」按钮，照着点即可。
 
@@ -58,7 +59,7 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 
 1. 登录 [Cloudflare](https://dash.cloudflare.com) → **Workers & Pages** → **创建** → **Workers**。
 2. 删掉模板代码，把 `index.js` 全文粘贴进去。
-3. **设置 → 变量与机密** 配 `PASSWORD`、`TOKEN_KEY`（与可选 `DOMAIN`）。
+3. **设置 → 变量与机密** 配 `PASSWORD`、`TOKEN_KEY`、`DOMAIN`，及可选 `ALLOW_MASTER_KEY`。
 4. 点 **部署**，访问 `你的Worker名.你的子域.workers.dev`。
 5. 可选：**设置 → 域与路由** 为你的域名（如 `git.abc.xyz`）添加路由。
 
@@ -68,8 +69,8 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 |---|---|---|---|
 | `PASSWORD` | （无，**必填**） | **GitHub Secrets** | 主页登录密码，**缺则无法登录** |
 | `TOKEN_KEY` | （无，**必填**） | **GitHub Secrets** | 令牌主密钥，**务必设随机长字符串**（不要用密码当这个） |
-| `DOMAIN` | 自动用访问域名 | GitHub Secrets（可选） | 反代域名；配了用自定义，不配自动用当前访问域名（如 `xxx.workers.dev`） |
-| `ALLOW_MASTER_KEY` | `false` | GitHub Secrets（可选） | 设为 `true` 才允许 `TOKEN_KEY` 本身直接作令牌；不配/留空则关闭 |
+| `DOMAIN` | （无，**必填**） | **GitHub Secrets** | 你的反代域名（如 `git.abc.xyz`）；Git 部署模式下缺失会部署失败 |
+| `ALLOW_MASTER_KEY` | （无，**必填**） | **GitHub Secrets** | 二选一：`false`（关闭主密钥直通）或 `true`（开启）；留空部署失败 |
 | `GUEST_IP_LIMIT` | `50` | 可选（GitHub Secrets 或 wrangler.toml） | 单个 IP 在每个配额窗口内的游客次数 |
 | `GUEST_GLOBAL_LIMIT` | `50` | 可选（GitHub Secrets 或 wrangler.toml） | 全站游客总量（同一窗口内，换 IP 也绕不过） |
 | `GUEST_WINDOW_SEC` | `86400` | 可选（GitHub Secrets 或 wrangler.toml） | 配额窗口时长（秒），默认 24 小时 |
@@ -82,19 +83,19 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 
 | 优先级 | 来源 | 谁写入 | 用于 |
 |---|---|---|---|
-| 🥇 最高 | Worker **机密**（secret） | GitHub Secrets → `deploy.yml` 的 `secrets:` → `wrangler secret put` | `PASSWORD`、`TOKEN_KEY`（必填）、`DOMAIN`（可选） |
+| 🥇 最高 | Worker **机密**（secret） | GitHub Secrets → `deploy.yml` 的 `secrets:` → `wrangler secret put` | `PASSWORD`、`TOKEN_KEY`、`DOMAIN`、`ALLOW_MASTER_KEY`（均必填） |
 | 🥈 第二 | Worker **普通变量**（var） | `wrangler.toml` 的 `[vars]`（默认全部注释、不启用） | 仅想微调配额等可选项时取消注释填值 |
 | 🥉 最低 | 代码默认兜底 | `index.js` 内置 | 某个配置哪都没配时才用 |
 
 规则与要点：
 
-- **`PASSWORD` / `TOKEN_KEY` 必填走 GitHub Secrets**，部署时由 `deploy.yml` 自动写入 Worker 机密（加密存储）。fork 部署零代码修改。
-- **`DOMAIN` 可选**：配了固定用你的自定义域名；不配时自动回退为「当前访问进来的域名」（CF 默认 `xxx.workers.dev` 或你绑定的自定义路由），所以 fork 后什么都不填也能直接用。
+- **四个运行配置全部必填走 GitHub Secrets**：`PASSWORD` / `TOKEN_KEY` / `DOMAIN` / `ALLOW_MASTER_KEY`，部署时由 `deploy.yml` 先校验、再写入 Worker 机密（加密存储）。fork 部署零代码修改，只需填好 6 个 secret。
+- **`ALLOW_MASTER_KEY` 二选一必填**：`false`（推荐，主密钥直通关闭）或 `true`（开启）。留空会直接部署失败（实测：wrangler-action 对空 secret 报错中断）。
 - **可选配额项**（游客次数、超时等）有代码默认值，一般不用动；想调时二选一：取消 `wrangler.toml` 里 `[vars]` 的注释填值，或放 GitHub Secrets 并在 `deploy.yml` 的 `secrets:` 列表加一行。
 - 同名冲突时 **secret 覆盖 var**（机密优先于普通变量）。
 - **改动生效方式**：改 `wrangler.toml` → `git push` 即自动部署；改 GitHub Secret → 到 Actions 点「Run workflow」手动触发一次部署才生效。
 
-> ⚠️ **`PASSWORD` / `TOKEN_KEY` 必填**，任一缺失，站点进入「未初始化」状态（登录/令牌全禁用）。`DOMAIN` 可选：不配自动用当前访问域名，配了用自定义。所有配置只走 GitHub Secrets，绝不默认弱密码裸奔。
+> ⚠️ **四个运行配置全部必填**：`PASSWORD` / `TOKEN_KEY`（缺失站点进入「未初始化」）、`DOMAIN`（你的反代域名）、`ALLOW_MASTER_KEY`（`false` 或 `true` 二选一）。任一缺失/留空都会在部署时的校验步骤被拦下。所有配置只走 GitHub Secrets，绝不默认弱密码裸奔。
 
 ## 使用方式
 
