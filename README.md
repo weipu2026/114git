@@ -63,17 +63,34 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 
 ### 环境变量
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `PASSWORD` | （无，**必填**） | 主页登录密码，**缺则无法登录** |
-| `TOKEN_KEY` | （无，**必填**） | 令牌主密钥，**务必设随机长字符串**（不要用密码当这个） |
-| `ALLOW_MASTER_KEY` | `false` | 设为 `true` 才允许 `TOKEN_KEY` 本身直接作令牌（跨日方便，但降低安全，默认关闭） |
-| `DOMAIN` | `git.114448.xyz` | 反代域名（替换 github.com 用的） |
-| `GUEST_IP_LIMIT` | `50` | 单个 IP 在每个配额窗口内的游客次数 |
-| `GUEST_GLOBAL_LIMIT` | `50` | 全站游客总量（同一窗口内，换 IP 也绕不过） |
-| `GUEST_WINDOW_SEC` | `86400` | 配额窗口时长（秒），默认 24 小时 |
-| `PROXY_TIMEOUT_MS` | `15000` | 代理回源超时（毫秒） |
-| `MAX_REDIRECTS` | `8` | 跳转跟随上限 |
+| 变量 | 默认值 | 在哪设置 | 说明 |
+|---|---|---|---|
+| `PASSWORD` | （无，**必填**） | **GitHub Secrets** | 主页登录密码，**缺则无法登录** |
+| `TOKEN_KEY` | （无，**必填**） | **GitHub Secrets** | 令牌主密钥，**务必设随机长字符串**（不要用密码当这个） |
+| `DOMAIN` | `git.114448.xyz` | **`wrangler.toml` `[vars]`** | 反代域名（替换 github.com 用的） |
+| `ALLOW_MASTER_KEY` | `false` | `wrangler.toml` `[vars]`（可选） | 设为 `true` 才允许 `TOKEN_KEY` 本身直接作令牌 |
+| `GUEST_IP_LIMIT` | `50` | `wrangler.toml` `[vars]`（可选） | 单个 IP 在每个配额窗口内的游客次数 |
+| `GUEST_GLOBAL_LIMIT` | `50` | `wrangler.toml` `[vars]`（可选） | 全站游客总量（同一窗口内，换 IP 也绕不过） |
+| `GUEST_WINDOW_SEC` | `86400` | `wrangler.toml` `[vars]`（可选） | 配额窗口时长（秒），默认 24 小时 |
+| `PROXY_TIMEOUT_MS` | `15000` | `wrangler.toml` `[vars]`（可选） | 代理回源超时（毫秒） |
+| `MAX_REDIRECTS` | `8` | `wrangler.toml` `[vars]`（可选） | 跳转跟随上限 |
+
+#### 配置来源与优先级
+
+同一名字可能来自不同地方，**从上到下依次生效（高优先级覆盖低优先级）**：
+
+| 优先级 | 来源 | 谁写入 | 用于 |
+|---|---|---|---|
+| 🥇 最高 | Worker **机密**（secret） | GitHub Secrets → `deploy.yml` 的 `secrets:` → `wrangler secret put` | `PASSWORD`、`TOKEN_KEY` |
+| 🥈 第二 | Worker **普通变量**（var） | `wrangler.toml` 的 `[vars]` → `wrangler deploy` | `DOMAIN`、`ALLOW_MASTER_KEY`、配额等 |
+| 🥉 最低 | 代码默认兜底 | `index.js` 内置 | 什么都不配时才用 |
+
+规则与要点：
+
+- **敏感项（`PASSWORD` / `TOKEN_KEY`）只放 GitHub Secrets**，绝不写进 `wrangler.toml`、代码或任何提交；部署时由 `deploy.yml` 自动写入 Worker 机密（加密存储）。
+- **非敏感项（`DOMAIN`、配额等）放 `wrangler.toml` 的 `[vars]`**，随代码版本管理、一眼可见。
+- 同名冲突时 **secret 覆盖 var**（机密优先于普通变量）。
+- **改动生效方式**：改 `wrangler.toml` → `git push` 即自动部署；改 GitHub Secret → 到 Actions 点「Run workflow」手动触发一次部署才生效。
 
 > ⚠️ **`PASSWORD` 与 `TOKEN_KEY` 是必填项**。任一缺失，站点会进入「未初始化」状态：登录被禁用、令牌一律无效（游客配额仍可用）。这样忘记配置也绝不会以弱默认密码「裸奔」。
 
@@ -143,6 +160,10 @@ curl -LO https://git.114448.xyz/user/repo/raw/branch/path/to/file
 6. 只部署这一个文件即可；不要再叠加老号 gh-proxy 的 `addEventListener` 写法（会冲突），本文件用的是模块式 `export default`。
 
 ## 更新日志
+
+### v1.0.1（2026-09-02 文档）
+
+- 环境变量表新增「在哪设置」列；新增「配置来源与优先级」小节：敏感项 `PASSWORD`/`TOKEN_KEY` 只在 GitHub Secrets，`DOMAIN` 等非敏感项在 `wrangler.toml [vars]`，同名时 secret 覆盖 var。
 
 ### v1.0（2026-09-02 正式发布）
 
