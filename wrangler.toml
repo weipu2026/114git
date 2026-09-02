@@ -3,15 +3,22 @@
 #  纯静态单文件 Worker，无构建步骤，无需 node 依赖
 # ============================================================================
 
-name = "114git"                 # Worker 名称，改成你 CF 上实际的名字
+name = "114git"                 # Worker 名称（CF 上的名字，如遇冲突可改名）
 main = "index.js"               # 入口文件
 compatibility_date = "2026-09-01"
 
-# 非敏感配置（可放这里，等同于 CF 后台「变量」）
-[vars]
-DOMAIN = "git.114448.xyz"       # 反代域名，改成你的
-
-# ⚠️ 敏感项 PASSWORD 与 TOKEN_KEY 切勿写进本文件（会被提交到 GitHub）！
-# 它们放在 GitHub Secrets 里，由 .github/workflows/deploy.yml 部署时自动
-# 写入 Worker 机密（wrangler-action 的 secrets 功能，等价于 wrangler secret put）。
-# 所以不用在 Cloudflare 后台手动配置这两个。
+# ⚠️ 运行配置全部放 GitHub Secrets，本文件不写死任何配置：
+#    PASSWORD / TOKEN_KEY / DOMAIN 三项必填，由 .github/workflows/deploy.yml
+#    部署时自动写入 Worker 机密（wrangler-action 的 secrets 功能）。
+#    fork 部署只需在 GitHub Secrets 配好这三项 + CF 的 API Token / Account ID，
+#    直接 push 即可上线，不用改任何代码。
+#
+# 可选配额项（有代码默认值，一般不用动）。想微调时，取消下面注释填值，
+# 或一并放到 GitHub Secrets 并在 deploy.yml 的 secrets 列表加一行：
+# [vars]
+# GUEST_IP_LIMIT   = "50"
+# GUEST_GLOBAL_LIMIT = "50"
+# GUEST_WINDOW_SEC = "86400"
+# PROXY_TIMEOUT_MS = "15000"
+# MAX_REDIRECTS    = "8"
+# ALLOW_MASTER_KEY = "false"
