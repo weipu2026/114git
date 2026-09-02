@@ -6,12 +6,12 @@
 //    PASSWORD         登录密码（必填）
 //    TOKEN_KEY        令牌主密钥（必填，随机长字符串）
 //    ALLOW_MASTER_KEY 设为 true 才允许主密钥直接作令牌（默认关闭，更安全）
-//    DOMAIN           反代域名，默认 git.114448.xyz
+//    DOMAIN           反代域名；不配则自动用当前访问域名（如 xxx.workers.dev）
 //  用法（路径反代，直接替换域名即可）：
-//    https://git.114448.xyz/user/repo(.git)        -> git clone
-//    https://git.114448.xyz/user/repo/archive/...   -> 源码包 zip
-//    https://git.114448.xyz/user/repo/releases/...  -> release 下载
-//    https://git.114448.xyz/user/repo/blob|raw/...  -> 单文件
+//    https://git.abc.xyz/user/repo(.git)        -> git clone
+//    https://git.abc.xyz/user/repo/archive/...   -> 源码包 zip
+//    https://git.abc.xyz/user/repo/releases/...  -> release 下载
+//    https://git.abc.xyz/user/repo/blob|raw/...  -> 单文件
 //  令牌：Web Crypto 由主密钥+日期派生，每天自动更换，16 位十六进制。
 //    可放 URL ?t=…、请求头 X-Proxy-Token、或作为路径首段。
 //  配额：内存计数（零外部依赖），重启清零，尽力而为。
@@ -25,7 +25,7 @@ function getConfig(env = {}) {
   const cfg = {
     password: env.PASSWORD ?? '',
     tokenKey: env.TOKEN_KEY ?? '',
-    domain: env.DOMAIN ?? 'git.114448.xyz',
+    domain: env.DOMAIN ?? '', // 空则回退为请求进来的域名（见 handle）
     guestIpLimit: Number(env.GUEST_IP_LIMIT ?? 50),
     guestGlobalLimit: Number(env.GUEST_GLOBAL_LIMIT ?? 50),
     guestWindowSec: Number(env.GUEST_WINDOW_SEC ?? 86400),
@@ -147,7 +147,7 @@ function toFullUrl(path) {
   let s = path;
   if (/^\/https?:\/\//i.test(s)) s = s.replace(/^\/https?:\/\//i, '');
   else if (/^\/github\.com\//i.test(s)) s = s.slice('/github.com/'.length);
-  else s = s.replace(/^\//, '');
+  else s = s.replace(/^\/+/, ''); // 去掉所有前导斜杠（防止 // 双斜杠归一化出错）
 
   if (/^raw\.githubusercontent\.com\//i.test(s)) return 'https://' + s;
   if (/^gist\.(?:githubusercontent|github)\.com\//i.test(s)) return 'https://' + s;
@@ -236,18 +236,17 @@ button.ghost{background:#fff;color:#0969da;border:1px solid #d0d7de}
 </style></head><body>
 <div class="card">
   <h1>114Git · 首次部署引导</h1>
-  <p class="sub">只差最后一步配置，照着做即可，不用改代码</p>
+  <p class="sub">配置未完成：请先在 GitHub 仓库配好下面两项，否则无法登录</p>
 
   <div class="steps">
-    <div class="step"><span class="num">1</span><div>打开 <b>Cloudflare 控制台</b>（dash.cloudflare.com）</div></div>
-    <div class="step"><span class="num">2</span><div>进入 <b>Workers &amp; Pages</b> → 你的 Worker → <b>设置</b> → <b>变量和机密</b></div></div>
-    <div class="step"><span class="num">3</span><div>点「添加变量」，填入下面两项（<b>必填</b>）</div></div>
+    <div class="step"><span class="num">1</span><div>打开 <b>GitHub 仓库</b> → <b>Settings</b> → <b>Secrets and variables</b> → <b>Actions</b></div></div>
+    <div class="step"><span class="num">2</span><div>点「New repository secret」，添加下面两项（<b>必填</b>）</div></div>
   </div>
 
   <table class="vars">
     <tr><td><code>PASSWORD</code></td><td>登录密码，随便设一个</td><td class="tag">必填</td></tr>
     <tr><td><code>TOKEN_KEY</code></td><td>令牌主密钥（用下方按钮生成）</td><td class="tag">必填</td></tr>
-    <tr><td><code>DOMAIN</code></td><td>反代域名（默认已可用，可跳过）</td><td>可选</td></tr>
+    <tr><td><code>DOMAIN</code></td><td>反代域名（可选，不配自动用 workers.dev）</td><td>可选</td></tr>
   </table>
 
   <div class="genkey">
@@ -258,11 +257,11 @@ button.ghost{background:#fff;color:#0969da;border:1px solid #d0d7de}
     </div>
   </div>
 
-  <div class="opt">其他配置项（<code>GUEST_IP_LIMIT</code>、<code>ALLOW_MASTER_KEY</code> 等）都有默认值，不填也能用。</div>
+  <div class="opt">其他配置项（<code>GUEST_IP_LIMIT</code>、<code>ALLOW_MASTER_KEY</code> 等）都有默认值，不填也能用。<br>若你是手动部署（不用 GitHub），则在 Cloudflare 后台的「变量和机密」里配同样两项。</div>
 
   <div class="steps">
-    <div class="step"><span class="num">4</span><div>点 <b>保存并部署</b>（环境变量要重新部署后才生效）</div></div>
-    <div class="step"><span class="num">5</span><div><b>刷新本页</b> → 出现登录页即成功</div></div>
+    <div class="step"><span class="num">3</span><div>到 Actions 页点 <b>Run workflow</b> 触发一次部署</div></div>
+    <div class="step"><span class="num">4</span><div><b>刷新本页</b> → 出现登录页即成功</div></div>
   </div>
 
   <div class="foot">114Git · 配置完成后本页会自动消失</div>
@@ -286,8 +285,8 @@ async function copyKey(ev){
 </body></html>`;
 }
 
-function renderIndex(cfg, token) {
-  const d = cfg.domain;
+function renderIndex(domain, token) {
+  const d = domain;
   const t = token;
   return `<!DOCTYPE html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -533,7 +532,7 @@ async function handle(req, env) {
   // 老 gh-proxy 兼容：/?q=github.com/user/repo → 302 到反代路径（避免老链接 404）
   if (path === '/' && url.searchParams.has('q')) {
     const q = url.searchParams.get('q').replace(/^https?:\/\//i, '');
-    if (/^github\.com\//i.test(q)) return Response.redirect('/' + q, 302);
+    if (/^github\.com\//i.test(q)) return Response.redirect(encodeURI('/' + q), 302);
   }
 
   // 主页
@@ -551,9 +550,15 @@ async function handle(req, env) {
       if (p === cfg.password) {
         loginFails.delete(loginIp);
         const token = await todayToken(cfg);
-        return html(renderIndex(cfg, token));
+        // 域名：优先用自定义 DOMAIN；未配置则回退为当前请求域名（CF 默认 xxx.workers.dev 或自定义路由域名）
+        const domain = cfg.domain || new URL(req.url).hostname;
+        return html(renderIndex(domain, token));
       }
-      // 记录失败；达阈值则锁定
+      // 记录失败；达阈值则锁定（顺带清理已过期的锁定记录，防 Map 无限增长）
+      if (loginFails.size > 500) {
+        const now0 = Date.now();
+        for (const [k, v] of loginFails) if (now0 >= v.lockUntil) loginFails.delete(k);
+      }
       const now = Date.now();
       let r = loginFails.get(loginIp) || { count: 0, lockUntil: 0 };
       r.count++;
@@ -570,7 +575,8 @@ async function handle(req, env) {
   let hasToken = false;
   if (segs.length && (await tokenValid(segs[0], cfg))) {
     hasToken = true;
-    rest = '/' + segs.slice(1).join('/');
+    // 精确切掉首段令牌，保留其余原文（含 //，避免 https:// 被拆坏）
+    rest = path.slice(1 + segs[0].length) || '/';
   } else {
     const t = url.searchParams.get('t') ?? req.headers.get('x-proxy-token') ?? '';
     if (await tokenValid(t, cfg)) hasToken = true;

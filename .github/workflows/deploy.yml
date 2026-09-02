@@ -19,12 +19,15 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # 每次部署自动把下面列出的 GitHub Secret 写入 Worker 机密（wrangler secret put）
-          # 必填三件套：PASSWORD / TOKEN_KEY / DOMAIN —— fork 部署只需配好这三个 + 上面两个 CF 令牌，直接推送即可上线
+          # PASSWORD / TOKEN_KEY 必填；DOMAIN 可选（配了用自定义，不配自动用 workers.dev）；
+          # ALLOW_MASTER_KEY 可选（配 true 才开启主密钥直通，不配/留空则关闭）
           secrets: |
             PASSWORD
             TOKEN_KEY
             DOMAIN
+            ALLOW_MASTER_KEY
         env:
           PASSWORD: ${{ secrets.PASSWORD }}
           TOKEN_KEY: ${{ secrets.TOKEN_KEY }}
           DOMAIN: ${{ secrets.DOMAIN }}
+          ALLOW_MASTER_KEY: ${{ secrets.ALLOW_MASTER_KEY }}

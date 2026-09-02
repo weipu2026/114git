@@ -47,7 +47,7 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
    - `CLOUDFLARE_API_TOKEN`（API Token，部署钥匙）
    - `PASSWORD`（登录密码）
    - `TOKEN_KEY`（令牌主密钥）
-   - `DOMAIN`（你的反代域名，如 `git.114448.xyz`）
+   - `DOMAIN`（你的反代域名，如 `git.abc.xyz`）
 4. 以后每次 `git push` 到 `main`，GitHub Actions 自动 `wrangler deploy`，并**自动把这三个运行配置（`PASSWORD` / `TOKEN_KEY` / `DOMAIN`）写入 Worker 机密**（wrangler-action 的 `secrets` 功能，等价 `wrangler secret put`，加密存储）。Cloudflare 那边**不需要手动配任何东西**。
 5. **改配置**（换密码/密钥/域名）：直接改对应 GitHub Secret 的值，然后到 Actions 页点「Run workflow」手动触发一次部署即同步。
 6. **fork 部署零代码修改**：全部配置集中在 GitHub Secrets，他人 fork 后只需填自己的一套 secret（5 个）即可使用，无需改动任何代码文件。
@@ -60,7 +60,7 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 2. 删掉模板代码，把 `index.js` 全文粘贴进去。
 3. **设置 → 变量与机密** 配 `PASSWORD`、`TOKEN_KEY`（与可选 `DOMAIN`）。
 4. 点 **部署**，访问 `你的Worker名.你的子域.workers.dev`。
-5. 可选：**设置 → 域与路由** 为你的域名（如 `git.114448.xyz`）添加路由。
+5. 可选：**设置 → 域与路由** 为你的域名（如 `git.abc.xyz`）添加路由。
 
 ### 环境变量
 
@@ -68,8 +68,8 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 |---|---|---|---|
 | `PASSWORD` | （无，**必填**） | **GitHub Secrets** | 主页登录密码，**缺则无法登录** |
 | `TOKEN_KEY` | （无，**必填**） | **GitHub Secrets** | 令牌主密钥，**务必设随机长字符串**（不要用密码当这个） |
-| `DOMAIN` | `git.114448.xyz`（兜底） | **GitHub Secrets**（必填） | 反代域名（替换 github.com 用的） |
-| `ALLOW_MASTER_KEY` | `false` | 可选（GitHub Secrets 或 wrangler.toml） | 设为 `true` 才允许 `TOKEN_KEY` 本身直接作令牌 |
+| `DOMAIN` | 自动用访问域名 | GitHub Secrets（可选） | 反代域名；配了用自定义，不配自动用当前访问域名（如 `xxx.workers.dev`） |
+| `ALLOW_MASTER_KEY` | `false` | GitHub Secrets（可选） | 设为 `true` 才允许 `TOKEN_KEY` 本身直接作令牌；不配/留空则关闭 |
 | `GUEST_IP_LIMIT` | `50` | 可选（GitHub Secrets 或 wrangler.toml） | 单个 IP 在每个配额窗口内的游客次数 |
 | `GUEST_GLOBAL_LIMIT` | `50` | 可选（GitHub Secrets 或 wrangler.toml） | 全站游客总量（同一窗口内，换 IP 也绕不过） |
 | `GUEST_WINDOW_SEC` | `86400` | 可选（GitHub Secrets 或 wrangler.toml） | 配额窗口时长（秒），默认 24 小时 |
@@ -82,18 +82,19 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 
 | 优先级 | 来源 | 谁写入 | 用于 |
 |---|---|---|---|
-| 🥇 最高 | Worker **机密**（secret） | GitHub Secrets → `deploy.yml` 的 `secrets:` → `wrangler secret put` | `PASSWORD`、`TOKEN_KEY`、`DOMAIN`（三项必填） |
+| 🥇 最高 | Worker **机密**（secret） | GitHub Secrets → `deploy.yml` 的 `secrets:` → `wrangler secret put` | `PASSWORD`、`TOKEN_KEY`（必填）、`DOMAIN`（可选） |
 | 🥈 第二 | Worker **普通变量**（var） | `wrangler.toml` 的 `[vars]`（默认全部注释、不启用） | 仅想微调配额等可选项时取消注释填值 |
 | 🥉 最低 | 代码默认兜底 | `index.js` 内置 | 某个配置哪都没配时才用 |
 
 规则与要点：
 
-- **三项必填走 GitHub Secrets**：`PASSWORD` / `TOKEN_KEY` / `DOMAIN`，部署时由 `deploy.yml` 自动写入 Worker 机密（加密存储）。fork 部署零代码修改。
+- **`PASSWORD` / `TOKEN_KEY` 必填走 GitHub Secrets**，部署时由 `deploy.yml` 自动写入 Worker 机密（加密存储）。fork 部署零代码修改。
+- **`DOMAIN` 可选**：配了固定用你的自定义域名；不配时自动回退为「当前访问进来的域名」（CF 默认 `xxx.workers.dev` 或你绑定的自定义路由），所以 fork 后什么都不填也能直接用。
 - **可选配额项**（游客次数、超时等）有代码默认值，一般不用动；想调时二选一：取消 `wrangler.toml` 里 `[vars]` 的注释填值，或放 GitHub Secrets 并在 `deploy.yml` 的 `secrets:` 列表加一行。
 - 同名冲突时 **secret 覆盖 var**（机密优先于普通变量）。
 - **改动生效方式**：改 `wrangler.toml` → `git push` 即自动部署；改 GitHub Secret → 到 Actions 点「Run workflow」手动触发一次部署才生效。
 
-> ⚠️ **三项必填**：`PASSWORD`、`TOKEN_KEY`、`DOMAIN`。前两者缺失，站点进入「未初始化」状态（登录/令牌全禁用）；`DOMAIN` 缺失会退回示例域名、生成的链接不可达。所有配置只走 GitHub Secrets，绝不默认弱密码裸奔。
+> ⚠️ **`PASSWORD` / `TOKEN_KEY` 必填**，任一缺失，站点进入「未初始化」状态（登录/令牌全禁用）。`DOMAIN` 可选：不配自动用当前访问域名，配了用自定义。所有配置只走 GitHub Secrets，绝不默认弱密码裸奔。
 
 ## 使用方式
 
@@ -103,8 +104,8 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 `https://github.com/user/repo`）→ 点「生成」，得到两条带令牌的链接：
 
 ```
-git clone https://git.114448.xyz/当天令牌/user/repo.git
-源码包    https://git.114448.xyz/当天令牌/user/repo/archive/refs/heads/分支.zip
+git clone https://git.abc.xyz/当天令牌/user/repo.git
+源码包    https://git.abc.xyz/当天令牌/user/repo/archive/refs/heads/分支.zip
 ```
 
 点「复制」即可直接使用。**带令牌 = 登录用户，不受游客配额限制。**
@@ -115,15 +116,15 @@ git clone https://git.114448.xyz/当天令牌/user/repo.git
 ### 2. 直接替换域名（快捷）
 
 - 原链接：`https://github.com/user/repo/archive/refs/heads/master.zip`
-- 替换后：`https://git.114448.xyz/user/repo/archive/refs/heads/master.zip`
+- 替换后：`https://git.abc.xyz/user/repo/archive/refs/heads/master.zip`
 
 其余路径一字不改。这种方式**不带令牌，按游客计费**（50 次/24h）。
 
 ### 3. git clone
 
 ```bash
-git clone https://git.114448.xyz/user/repo.git        # 游客方式（有配额）
-git clone https://git.114448.xyz/当天令牌/user/repo.git  # 登录方式（不限）
+git clone https://git.abc.xyz/user/repo.git        # 游客方式（有配额）
+git clone https://git.abc.xyz/当天令牌/user/repo.git  # 登录方式（不限）
 ```
 
 令牌也可用 `?t=令牌` 或请求头 `X-Proxy-Token: 令牌` 携带（命令行工具用 URL 形式最方便）。
@@ -131,7 +132,7 @@ git clone https://git.114448.xyz/当天令牌/user/repo.git  # 登录方式（�
 ### 4. 单文件下载
 
 ```bash
-curl -LO https://git.114448.xyz/user/repo/raw/branch/path/to/file
+curl -LO https://git.abc.xyz/user/repo/raw/branch/path/to/file
 ```
 
 `/blob/...` 路径会自动转为 `/raw/`，curl/wget 拿到的是文件内容而非网页。
@@ -161,6 +162,15 @@ curl -LO https://git.114448.xyz/user/repo/raw/branch/path/to/file
 6. 只部署这一个文件即可；不要再叠加老号 gh-proxy 的 `addEventListener` 写法（会冲突），本文件用的是模块式 `export default`。
 
 ## 更新日志
+
+### v1.1（2026-09-02 终审修复）
+
+- **修复 BUG**：令牌 + 完整 URL 路径（`/令牌/https://github.com/...`）此前会 404——token 剥离用 `split/join` 拆坏了 `https://`，改用精确切片保留 `//`。
+- **修复**：登录失败记录 Map 无过期清理 → 超 500 条时惰性清理，防内存增长。
+- **修复**：`//` 双斜杠路径归一化（`//github.com/user/repo` 不再生成坏链接）。
+- **修复**：`?q=` 兼容参数补 `encodeURI` 编码，避免含特殊字符时 302 失败。
+- **更新**：部署引导页文案对齐 GitHub Secrets 流程（此前还指向 CF 后台）。
+- 已知低风险项维持现状（token 误判概率≈0、307 重定向 body 流极罕见）。
 
 ### v1.0.2（2026-09-02 配置全量迁至 GitHub Secrets）
 
