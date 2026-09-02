@@ -1,0 +1,17 @@
+# ============================================================================
+#  114Git —— 部署配置（Wrangler）
+#  纯静态单文件 Worker，无构建步骤，无需 node 依赖
+# ============================================================================
+
+name = "114git"                 # Worker 名称，改成你 CF 上实际的名字
+main = "index.js"               # 入口文件
+compatibility_date = "2026-09-01"
+
+# 非敏感配置（可放这里，等同于 CF 后台「变量」）
+[vars]
+DOMAIN = "git.114448.xyz"       # 反代域名，改成你的
+
+# ⚠️ 敏感项 PASSWORD 与 TOKEN_KEY 切勿写进本文件（会被提交到 GitHub）！
+# 它们放在 GitHub Secrets 里，由 .github/workflows/deploy.yml 部署时自动
+# 写入 Worker 机密（wrangler-action 的 secrets 功能，等价于 wrangler secret put）。
+# 所以不用在 Cloudflare 后台手动配置这两个。

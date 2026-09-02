@@ -1,0 +1,14 @@
+# Wrangler 本地缓存
+.wrangler/
+
+# 依赖（本项目暂无，保留以防将来引入）
+node_modules/
+
+# 日志
+*.log
+
+# 本地 UI 预览文件（无需进仓库，部署只靠 index.js）
+preview-*.html
+
+# 系统文件
+.DS_Store

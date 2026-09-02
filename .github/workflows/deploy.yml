@@ -1,0 +1,27 @@
+name: 部署 114Git
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # 改完 GitHub 配置后，可在此手动触发部署
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: 部署到 Cloudflare Workers
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v6
+
+      - name: 部署并同步机密
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 每次部署自动把下面列出的 GitHub Secret 写入 Worker 机密（wrangler secret put）
+          secrets: |
+            PASSWORD
+            TOKEN_KEY
+        env:
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TOKEN_KEY: ${{ secrets.TOKEN_KEY }}
