@@ -26,6 +26,7 @@
 
 ```
 index.js                        Worker 代码（部署的核心，唯一入口）
+test.mjs                        本地端到端回归测试（node test.mjs，零依赖，35 项断言）
 wrangler.toml                    Wrangler 配置（Worker 名、DOMAIN 等非敏感项）
 .github/workflows/deploy.yml     GitHub Actions 自动部署脚本（push 即上线）
 .gitignore                       忽略本地预览与缓存
@@ -72,7 +73,7 @@ preview-*.html                   UI 本地预览（临时，已被 .gitignore �
 | `DOMAIN` | （无，**必填**） | **GitHub Secrets** | 你的反代域名（如 `git.abc.xyz`）；Git 部署模式下缺失会部署失败 |
 | `ALLOW_MASTER_KEY` | （无，**必填**） | **GitHub Secrets** | 二选一：`false`（关闭主密钥直通）或 `true`（开启）；留空部署失败 |
 | `GUEST_IP_LIMIT` | `50` | 可选（GitHub Secrets 或 wrangler.toml） | 单个 IP 在每个配额窗口内的游客次数 |
-| `GUEST_GLOBAL_LIMIT` | `50` | 可选（GitHub Secrets 或 wrangler.toml） | 全站游客总量（同一窗口内，换 IP 也绕不过） |
+| `GUEST_GLOBAL_LIMIT` | `500` | 可选（GitHub Secrets 或 wrangler.toml） | 全站游客总量（同一窗口内，换 IP 也绕不过） |
 | `GUEST_WINDOW_SEC` | `86400` | 可选（GitHub Secrets 或 wrangler.toml） | 配额窗口时长（秒），默认 24 小时 |
 | `PROXY_TIMEOUT_MS` | `15000` | 可选（GitHub Secrets 或 wrangler.toml） | 代理回源超时（毫秒） |
 | `MAX_REDIRECTS` | `8` | 可选（GitHub Secrets 或 wrangler.toml） | 跳转跟随上限 |
@@ -111,7 +112,9 @@ git clone https://git.abc.xyz/当天令牌/user/repo.git
 
 点「复制」即可直接使用。**带令牌 = 登录用户，不受游客配额限制。**
 
-> 💡 **分支不用填**：生成时会自动调用 GitHub API 识别仓库默认分支（`main`/`master`）
+> 💡 **登录保持**：登录后写入 HttpOnly 会话 Cookie（值为当日令牌），当天内刷新页面不用重复输密码；跨天随令牌一起失效。
+>
+> 💡 **分支不用填**：生成时会自动经本站反代调用 GitHub API 识别仓库默认分支（`main`/`master`）
 > 并回填；识别失败自动回退 `main`。也可以在「分支/标签」框手动指定，或切换到「标签」下载某个 tag。
 
 ### 2. 直接替换域名（快捷）
@@ -147,11 +150,16 @@ curl -LO https://git.abc.xyz/user/repo/raw/branch/path/to/file
 
 ## 安全设计摘要
 
-- **防 SSRF**：反代目标仅限 GitHub 官方域名白名单；代理内的跳转也必须在白名单内，否则交给浏览器自行跟随。
+- **防 SSRF**：反代目标仅限 GitHub 官方域名白名单；代理内的跳转也必须在白名单内，否则交给浏览器自行跟随。完整 URL 形式的路径经归一化后同样只会命中白名单域名。
 - **敏感头过滤**：转发时剔除 `Cookie`、`Authorization`、`X-Proxy-Token`，防止把客户端的凭据漏给上游。
+- **隐私头过滤**：转发时剔除 `CF-Connecting-IP`、`X-Forwarded-For`、`X-Real-IP`、`Forwarded` 等头，访客真实 IP 不泄露给 GitHub。
 - **令牌页防缓存**：登录页/输入框页返回 `Cache-Control: no-store`，令牌不会随 CDN/浏览器缓存泄露。
+- **会话 Cookie**：登录态用 HttpOnly + Secure + SameSite=Lax 的 Cookie 保持，值为当日令牌，跨日自动失效。
+- **常量时间比较**：登录密码使用 `crypto.subtle.timingSafeEqual`（不可用时逐字节异或兜底）比较，防时序侧信道。
+- **上游 Cookie 不透传**：响应中的 `Set-Cookie` 一律删除。
+- **页面安全头**：`X-Frame-Options: DENY`（防 iframe 嵌套钓鱼）、`Referrer-Policy: no-referrer`、`X-Content-Type-Options: nosniff`、HSTS。
 - **UA 伪装**：以普通浏览器 UA 请求 GitHub，降低被 403/429 的概率。
-- **超时与跳转上限**：回源 15s 超时；跳转最多跟随 8 次；307/308 保持原方法与请求体。
+- **超时与跳转上限**：所有跳转的「响应头等待时间」共享 15s 整体 deadline（响应体流式传输不受限）；跳转最多跟随 8 次；307/308 保持原方法与请求体（≤50MB 的请求体自动缓冲以便重发）。
 
 ## 注意事项
 
@@ -163,6 +171,23 @@ curl -LO https://git.abc.xyz/user/repo/raw/branch/path/to/file
 6. 只部署这一个文件即可；不要再叠加老号 gh-proxy 的 `addEventListener` 写法（会冲突），本文件用的是模块式 `export default`。
 
 ## 更新日志
+
+### v1.2（2026-09-02 深度审计修复：12 处）
+
+- **修复 P0**：代理全程只传 `pathname`、丢弃查询串 → git clone 第一步 `?service=git-upload-pack` 丢失，GitHub 返回 403（已禁 dumb HTTP），**clone 实际不可用**。现保留查询串转发（仅剔除令牌参数 `t` 防外漏），已实测 smart HTTP 协议响应恢复 `x-git-upload-pack-advertisement`。
+- **修复泄露**：转发头剔除 `CF-Connecting-IP`、`X-Forwarded-For`、`X-Real-IP`、`Forwarded`、`CF-*` 等——此前访客真实 IP 会透传给 GitHub，违背反代隐私初衷。
+- **修复体验**：登录后写入 HttpOnly 会话 Cookie（值 = 当日令牌，跨日失效），刷新页面不再掉线。
+- **修复**：默认分支识别改为经本站反代请求 `api.github.com`（此前浏览器直连，国内超时静默回退 main，非 main 仓库 zip 下错分支）；白名单相应加入 `api.github.com`。
+- **修复**：307/308 重定向复用已消费的请求体流（git push / LFS 可能触发）→ ≤50MB 请求体自动缓冲以便重发，超大请求体明确返回 502。
+- **修复**：跳转超时无整体 deadline（9 跳 × 15s = 135s，远超 Workers 30s 限制）→ 所有跳转的响应头等待时间共享 15s deadline；响应体流式传输不受限，超时返回 504。
+- **修复**：密码比较改常量时间（`crypto.subtle.timingSafeEqual` + 逐字节异或兜底），防时序侧信道。
+- **修复**：502 错误不再回显上游异常详情（`proxy error: <内部信息>`）。
+- **调整**：全局游客配额默认 50 → 500 次/24h——原值下任意单人即可耗光全站游客额度（自我 DoS）；单 IP 限 50 不变。
+- **加固**：页面统一安全头 `X-Frame-Options: DENY` / `Referrer-Policy: no-referrer` / `X-Content-Type-Options: nosniff` / HSTS；上游 `Set-Cookie` 不透传；`CORS: *` 仅在上游未提供时补设；嵌入 `<script>` 的 DOMAIN/TOKEN 转义 `<` 防 `</script>` 闭合（防御性）；密钥生成器消除模偏置（重采样法）。
+- **修复**：`blob→raw` 只对「仓库路径后紧跟的 blob」生效，路径中含 blob 字样的分支/目录不再误转。
+- **修复**：`/?q=` 兼容跳转改用 `new Response(null, {302, location})`（`Response.redirect` 相对路径在非 Workers runtime 会抛错）；`checkPath` 的 `git-` 前缀判断补 `toLowerCase`；移除配置的模块级缓存冗余状态。
+- **测试**：新增 `test.mjs`（`node test.mjs` 零依赖运行）——35 项断言全绿，mock 层覆盖代理行为（查询串保留、令牌剥离、头剔除、重定向、配额），真实出站层验证 git smart HTTP 协议响应。
+- README 修正：v1.0.2 更新日志中 secret 数量「5 个」→「6 个」（补 ALLOW_MASTER_KEY）。
 
 ### v1.1（2026-09-02 终审修复）
 
