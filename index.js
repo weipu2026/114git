@@ -17,17 +17,14 @@
 //  配额：内存计数（零外部依赖），重启清零，尽力而为。
 // ============================================================================
 
-// ------------------------------ 配置（惰性，从 env 读取） ------------------------------
-const _configCache = new Map();
-
+// ------------------------------ 配置（每次请求从 env 读取，无缓存状态） ------------------------------
 function getConfig(env = {}) {
-  if (_configCache.has('cfg')) return _configCache.get('cfg');
   const cfg = {
     password: env.PASSWORD ?? '',
     tokenKey: env.TOKEN_KEY ?? '',
     domain: env.DOMAIN ?? '', // 空则回退为请求进来的域名（见 handle）
     guestIpLimit: Number(env.GUEST_IP_LIMIT ?? 50),
-    guestGlobalLimit: Number(env.GUEST_GLOBAL_LIMIT ?? 50),
+    guestGlobalLimit: Number(env.GUEST_GLOBAL_LIMIT ?? 500),
     guestWindowSec: Number(env.GUEST_WINDOW_SEC ?? 86400),
     timeoutMs: Number(env.PROXY_TIMEOUT_MS ?? 15000),
     maxRedirects: Number(env.MAX_REDIRECTS ?? 8),
@@ -36,13 +33,13 @@ function getConfig(env = {}) {
   };
   // 生产安全：PASSWORD 与 TOKEN_KEY 缺一不可；未配置即视为未初始化，拒绝登录/令牌
   cfg.initialized = Boolean(cfg.password && cfg.tokenKey);
-  _configCache.set('cfg', cfg);
   return cfg;
 }
 
 // ----------------------- 允许走反代的 host（严格白名单，防 SSRF） -----------------------
 const ALLOWED_HOSTS = new Set([
   'github.com',
+  'api.github.com',
   'raw.githubusercontent.com',
   'gist.github.com',
   'gist.githubusercontent.com',
@@ -106,6 +103,20 @@ async function sha256Hex(str) {
   return hex;
 }
 
+// 常量时间比较（防时序侧信道）：优先 Workers 的 crypto.subtle.timingSafeEqual，不可用时兜底逐字节异或
+function safeEqual(a, b) {
+  const ea = enc.encode(String(a));
+  const eb = enc.encode(String(b));
+  if (ea.byteLength !== eb.byteLength) return false;
+  try {
+    return crypto.subtle.timingSafeEqual(ea, eb);
+  } catch {
+    let d = 0;
+    for (let i = 0; i < ea.byteLength; i++) d |= ea[i] ^ eb[i];
+    return d === 0;
+  }
+}
+
 function todayStr() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
@@ -130,7 +141,7 @@ function checkPath(p) {
   if (!p || !p.startsWith('/')) return false;
   // 完整 URL 前缀 / 完整域名前缀：直接放行（显式写明上游域名，可信）
   if (/^\/https?:\/\//i.test(p)) return true;
-  if (/^\/(github\.com|raw\.githubusercontent\.com|gist\.(?:githubusercontent|github)\.com|codeload\.github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com|patch-diff\.githubusercontent\.com|github\.githubassets\.com)\//i.test(p)) return true;
+  if (/^\/(github\.com|api\.github\.com|raw\.githubusercontent\.com|gist\.(?:githubusercontent|github)\.com|codeload\.github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com|patch-diff\.githubusercontent\.com|github\.githubassets\.com)\//i.test(p)) return true;
   // raw/ gist/ 短前缀：后续是 user/repo/branch/file，直接放行
   if (/^\/(raw|gist)\//i.test(p)) return true;
   // 纯路径形式 /user/repo[/(已知关键词|git-...)]
@@ -139,7 +150,7 @@ function checkPath(p) {
   if (seg.length === 2) return true; // user/repo 或 user/repo.git（clone 入口）
   if (/\.git$/i.test(seg[1])) return true; // user/repo.git/任意（smart HTTP）
   const third = seg[2].toLowerCase();
-  if (seg[2].startsWith('git-') || ['releases','archive','blob','raw','info','tags','tarball','zipball','commit','compare','branches'].includes(third)) return true;
+  if (third.startsWith('git-') || ['releases','archive','blob','raw','info','tags','tarball','zipball','commit','compare','branches'].includes(third)) return true;
   return false;
 }
 
@@ -149,6 +160,7 @@ function toFullUrl(path) {
   else if (/^\/github\.com\//i.test(s)) s = s.slice('/github.com/'.length);
   else s = s.replace(/^\/+/, ''); // 去掉所有前导斜杠（防止 // 双斜杠归一化出错）
 
+  if (/^api\.github\.com\//i.test(s)) return 'https://' + s;
   if (/^raw\.githubusercontent\.com\//i.test(s)) return 'https://' + s;
   if (/^gist\.(?:githubusercontent|github)\.com\//i.test(s)) return 'https://' + s;
   if (/^codeload\.github\.com\//i.test(s)) return 'https://' + s;
@@ -161,7 +173,8 @@ function toFullUrl(path) {
 
   s = s.replace(/^github\.com\//i, '');
   // blob 网页路径 → raw 文件路径，让 curl/wget 直接拿到文件内容而非 HTML 页面
-  s = s.replace(/\/blob\//i, '/raw/');
+  // 仅替换「仓库路径后紧跟的 blob」，避免误伤路径中含 blob 字样的分支/目录
+  s = s.replace(/^([^/]+\/[^/]+)\/blob\//i, '$1/raw/');
   return 'https://github.com/' + s;
 }
 
@@ -176,6 +189,13 @@ function isAllowedHost(urlStr) {
 // --------------------------- 页面渲染 HTML ---------------------------
 const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// 嵌入 <script> 的 JS 字符串字面量：JSON.stringify 之后再转义 < 与行分隔符，防 </script> 提前闭合标签
+const jsStr = (s) =>
+  JSON.stringify(String(s))
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 
 function renderLogin(wrong = false, msg = '') {
   const showErr = wrong ? '' : 'display:none';
@@ -271,8 +291,14 @@ const $=(id)=>document.getElementById(id);
 let _key='';
 function genKey(){
   const chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const arr=new Uint8Array(40); crypto.getRandomValues(arr);
-  _key=''; for(let i=0;i<arr.length;i++) _key+=chars[arr[i]%chars.length];
+  const max=Math.floor(256/chars.length)*chars.length;
+  const a=new Uint8Array(1);
+  let k='';
+  for(let i=0;i<40;i++){
+    let b; do { crypto.getRandomValues(a); b=a[0]; } while(b>=max);
+    k+=chars[b%chars.length];
+  }
+  _key=k;
   $('key').textContent=_key;
 }
 async function copyKey(ev){
@@ -361,7 +387,7 @@ a.btn.sm:hover{background:#1a7f37}
         <div class="v" id="c"></div>
       </div>
       <div class="item">
-        <div class="item-hd"><span class="k">源码包 (zip)</span><a class="btn sm" id="dz" href="#" target="_blank" rel="noopener">下载</a></div>
+        <div class="item-hd"><span class="k">源码包 (zip)</span><a class="btn sm" id="dz" href="#" target="_blank" rel="noopener noreferrer">下载</a></div>
         <div class="v" id="z"></div>
       </div>
     </div>
@@ -374,7 +400,7 @@ a.btn.sm:hover{background:#1a7f37}
   <div class="foot">114Git · 个人自用</div>
 </div>
 <script>
-const DOMAIN = ${JSON.stringify(d)}, TOKEN = ${JSON.stringify(t)};
+const DOMAIN = ${jsStr(d)}, TOKEN = ${jsStr(t)};
 const $ = (id) => document.getElementById(id);
 async function gen() {
   const err = $('err'); err.textContent = '';
@@ -406,8 +432,9 @@ async function gen() {
 }
 
 async function getDefaultBranch(repo) {
+  // 走自身反代请求 api.github.com（不直连）：国内网络无需直连 GitHub，带令牌不计游客配额
   try {
-    const r = await fetch('https://api.github.com/repos/' + repo);
+    const r = await fetch('/' + TOKEN + '/api.github.com/repos/' + repo);
     if (!r.ok) return 'main';
     const d = await r.json();
     return d.default_branch || 'main';
@@ -451,39 +478,78 @@ loadHist();
 }
 
 // --------------------------- 代理（迭代跟随跳转，防栈溢出） ---------------------------
+// 转发前剔除的请求头：凭据类 + 隐私类（不把访客真实 IP / CF 内部头透传给上游）
+const STRIP_REQ_HEADERS = new Set([
+  'host', 'cookie', 'authorization', 'x-proxy-token',
+  'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker', 'cf-ew-via',
+  'cdn-loop',
+  'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-forwarded-port', 'x-real-ip', 'forwarded', 'via',
+]);
+
+// 带 body 的请求最多缓冲 50MB，用于 307/308 重定向时重发（body 流只能读一次）；超大 body 不缓冲，遇 307/308 明确失败
+const MAX_BUFFERED_BODY = 50 * 1024 * 1024;
+
 async function proxy(req, target, cfg) {
   let url = target;
   let method = req.method;
-  let body = ['GET', 'HEAD'].includes(method) ? undefined : req.body;
+
+  // 缓冲请求体：git push / LFS 的 307/308 场景需要重发 body。
+  // content-length 未知（chunked）时也缓冲；明确超过上限则不缓冲，遇 307/308 明确失败
+  let bodyBuf = null;
+  if (method !== 'GET' && method !== 'HEAD') {
+    const clen = Number(req.headers.get('content-length') || 0);
+    if (clen <= MAX_BUFFERED_BODY) {
+      try { bodyBuf = await req.arrayBuffer(); } catch { bodyBuf = null; }
+    }
+  }
+
+  // 整体 deadline：所有跳转的「响应头等待时间」累计不超过 timeoutMs。
+  // 响应头到达后即取消计时，响应体流式传输不受 deadline 影响（大文件下载由平台总时长约束）
+  const deadline = Date.now() + cfg.timeoutMs;
 
   for (let i = 0; i <= cfg.maxRedirects; i++) {
+    if (method !== 'GET' && method !== 'HEAD' && bodyBuf === null && i > 0) {
+      // 原始 body 流已消费且未缓冲（超大 body），307/308 后无法重发
+      return new Response('proxy error', { status: 502 });
+    }
+
     const h = new Headers();
     for (const [k, v] of req.headers) {
-      const lk = k.toLowerCase();
-      if (lk === 'host' || lk === 'cookie' || lk === 'authorization' || lk === 'x-proxy-token') continue;
+      if (STRIP_REQ_HEADERS.has(k.toLowerCase())) continue;
       h.set(k, v);
     }
     h.set('user-agent', UA);
     h.set('accept', '*/*');
 
+    const remain = deadline - Date.now();
+    if (remain <= 0) return new Response('proxy timeout', { status: 504 });
+
     let res;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), remain);
     try {
       res = await fetch(url, {
         method,
         headers: h,
         redirect: 'manual',
-        body,
-        signal: typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(cfg.timeoutMs) : undefined,
+        body: method === 'GET' || method === 'HEAD' ? undefined : (bodyBuf ?? req.body),
+        signal: ac.signal,
       });
     } catch (e) {
-      return new Response('proxy error: ' + (e?.message ?? e), { status: 502 });
+      clearTimeout(timer);
+      const aborted = e && (e.name === 'AbortError' || e.name === 'TimeoutError');
+      console.error('114git proxy error:', e && e.message ? e.message : e);
+      return new Response(aborted ? 'proxy timeout' : 'proxy error', { status: aborted ? 504 : 502 });
     }
+    clearTimeout(timer); // 响应头已到，取消计时；响应体流式传输不受 deadline 影响
 
     const out = new Headers(res.headers);
-    out.set('access-control-allow-origin', '*');
+    if (!out.has('access-control-allow-origin')) out.set('access-control-allow-origin', '*');
+    out.set('x-content-type-options', 'nosniff');
     out.delete('content-security-policy');
     out.delete('content-security-policy-report-only');
     out.delete('clear-site-data');
+    out.delete('set-cookie'); // 不把上游 Cookie 透传给客户端
 
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
@@ -496,10 +562,10 @@ async function proxy(req, target, cfg) {
       }
       url = abs;
       if (res.status === 307 || res.status === 308) {
-        // 307/308 必须保持原方法与请求体（clone 大仓库/lfs 场景）
+        // 307/308 必须保持原方法与请求体（clone 大仓库/lfs 场景），bodyBuf 可重复使用
       } else {
         method = 'GET'; // 301/302/303 通常转 GET
-        body = undefined;
+        bodyBuf = null;
       }
       continue;
     }
@@ -510,13 +576,39 @@ async function proxy(req, target, cfg) {
 
 // --------------------------- 入口 ---------------------------
 function html(s, extraHeaders = {}) {
-  // 页面内嵌当天令牌，禁止缓存，防止令牌随 CDN/浏览器缓存泄露
+  // 页面内嵌当天令牌，禁止缓存，防止令牌随 CDN/浏览器缓存泄露；统一安全响应头
   return new Response(s, {
-    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store, max-age=0', ...extraHeaders },
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store, max-age=0',
+      'x-frame-options': 'DENY',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      ...extraHeaders,
+    },
   });
 }
 function text(s, status = 200) {
-  return new Response(s, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store, max-age=0' } });
+  return new Response(s, {
+    status,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store, max-age=0',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+    },
+  });
+}
+
+// 解析请求 Cookie 中某个名字的值
+function getCookie(req, name) {
+  const c = req.headers.get('cookie') || '';
+  for (const part of c.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
 }
 
 async function handle(req, env) {
@@ -532,7 +624,9 @@ async function handle(req, env) {
   // 老 gh-proxy 兼容：/?q=github.com/user/repo → 302 到反代路径（避免老链接 404）
   if (path === '/' && url.searchParams.has('q')) {
     const q = url.searchParams.get('q').replace(/^https?:\/\//i, '');
-    if (/^github\.com\//i.test(q)) return Response.redirect(encodeURI('/' + q), 302);
+    if (/^github\.com\//i.test(q)) {
+      return new Response(null, { status: 302, headers: { location: encodeURI('/' + q) } });
+    }
   }
 
   // 主页
@@ -547,12 +641,15 @@ async function handle(req, env) {
       }
       const f = await req.formData().catch(() => null);
       const p = f?.get('p') ?? '';
-      if (p === cfg.password) {
+      if (safeEqual(p, cfg.password)) {
         loginFails.delete(loginIp);
         const token = await todayToken(cfg);
         // 域名：优先用自定义 DOMAIN；未配置则回退为当前请求域名（CF 默认 xxx.workers.dev 或自定义路由域名）
         const domain = cfg.domain || new URL(req.url).hostname;
-        return html(renderIndex(domain, token));
+        // 会话 Cookie：值 = 当日令牌（HttpOnly/Secure），跨日随令牌一起失效，免每次输密码
+        return html(renderIndex(domain, token), {
+          'set-cookie': `ga=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`,
+        });
       }
       // 记录失败；达阈值则锁定（顺带清理已过期的锁定记录，防 Map 无限增长）
       if (loginFails.size > 500) {
@@ -565,6 +662,12 @@ async function handle(req, env) {
       if (r.count >= MAX_LOGIN_FAILS) { r.count = 0; r.lockUntil = now + LOGIN_LOCK_MS; }
       loginFails.set(loginIp, r);
       return html(renderLogin(true));
+    }
+    // 已有有效会话（当日令牌 Cookie）→ 免登录直接进生成页，刷新不掉线
+    const sid = getCookie(req, 'ga');
+    if (sid && (await tokenValid(sid, cfg))) {
+      const domain = cfg.domain || new URL(req.url).hostname;
+      return html(renderIndex(domain, await todayToken(cfg)));
     }
     return html(renderLogin(false));
   }
@@ -597,7 +700,11 @@ async function handle(req, env) {
     consume('global', cfg.guestGlobalLimit, cfg.guestWindowSec);
   }
 
-  const target = toFullUrl(rest);
+  // 保留查询串转发（git smart HTTP 的 ?service= 必需；gist ?raw=1 等同理），仅剔除令牌参数 t 防外漏
+  const sp = new URLSearchParams(url.search);
+  sp.delete('t');
+  const qs = sp.toString();
+  const target = toFullUrl(rest) + (qs ? '?' + qs : '');
   return proxy(req, target, cfg);
 }
 
