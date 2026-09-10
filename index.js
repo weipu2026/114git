@@ -18,16 +18,23 @@
 // ============================================================================
 
 // ------------------------------ 配置（每次请求从 env 读取，无缓存状态） ------------------------------
+// 数值配置净化：env 是字符串，写错（如 GUEST_IP_LIMIT=abc）会得到 NaN，
+// 而 NaN 参与比较恒为 false → 配额会被静默关掉。这里统一回退到默认值。
+function num(v, def, { min = 0 } = {}) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= min ? n : def;
+}
+
 function getConfig(env = {}) {
   const cfg = {
     password: env.PASSWORD ?? '',
     tokenKey: env.TOKEN_KEY ?? '',
     domain: env.DOMAIN ?? '', // 空则回退为请求进来的域名（见 handle）
-    guestIpLimit: Number(env.GUEST_IP_LIMIT ?? 50),
-    guestGlobalLimit: Number(env.GUEST_GLOBAL_LIMIT ?? 500),
-    guestWindowSec: Number(env.GUEST_WINDOW_SEC ?? 86400),
-    timeoutMs: Number(env.PROXY_TIMEOUT_MS ?? 15000),
-    maxRedirects: Number(env.MAX_REDIRECTS ?? 8),
+    guestIpLimit: num(env.GUEST_IP_LIMIT ?? 50, 50),
+    guestGlobalLimit: num(env.GUEST_GLOBAL_LIMIT ?? 500, 500),
+    guestWindowSec: num(env.GUEST_WINDOW_SEC ?? 86400, 86400),
+    timeoutMs: num(env.PROXY_TIMEOUT_MS ?? 15000, 15000, { min: 1 }),
+    maxRedirects: Math.min(num(env.MAX_REDIRECTS ?? 8, 8), 20),
     // 主密钥直通：默认关闭。设为 true/1/yes 时才允许 TOKEN_KEY 本身作为令牌（跨日方便，但降低安全性）
     allowMasterKey: ['true', '1', 'yes'].includes(String(env.ALLOW_MASTER_KEY ?? '').toLowerCase()),
   };
@@ -131,9 +138,9 @@ async function tokenValid(t, cfg) {
   if (!t || typeof t !== 'string') return false;
   if (!cfg.initialized) return false; // 未配置密钥时，令牌一律无效
   const real = await todayToken(cfg);
-  if (t === real) return true;
+  if (safeEqual(t, real)) return true;
   // 主密钥直通：仅当显式开启（ALLOW_MASTER_KEY=true）时才接受主密钥本身
-  return cfg.allowMasterKey && t === cfg.tokenKey;
+  return cfg.allowMasterKey && safeEqual(t, cfg.tokenKey);
 }
 
 // --------------------------- 校验 & 归一化 ---------------------------
@@ -419,7 +426,8 @@ async function gen() {
   // 防御：分支框若被误填成 URL，清空走自动识别（避免生成 refs/heads/https://… 坏链接）
   if (br && (br.includes('://') || br.startsWith('www.'))) { br = ''; $('br').value = ''; }
   if (!br) {
-    // 留空则自动识别仓库默认分支（main/master），失败回退 main
+    if (bt === 'tags') { err.textContent = '请填写标签名（自动识别的是默认分支，不是标签）'; return; }
+    // 分支模式留空才自动识别仓库默认分支（main/master），失败回退 main
     $('z').textContent = '正在识别默认分支…';
     $('dz').href = '#';
     br = await getDefaultBranch(repo);
@@ -459,7 +467,14 @@ $('u').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDe
 function loadHist() {
   try {
     const arr = JSON.parse(localStorage.getItem('gh114hist') || '[]');
-    $('hist').innerHTML = arr.map((s) => '<option value="' + s.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">').join('');
+    // 安全构造 DOM（不用 innerHTML，历史记录含 <> 时也不会注入）
+    const dl = $('hist');
+    dl.innerHTML = '';
+    for (const s of arr) {
+      const o = document.createElement('option');
+      o.value = String(s);
+      dl.appendChild(o);
+    }
   } catch (e) {}
 }
 function saveHist(s) {
@@ -486,20 +501,53 @@ const STRIP_REQ_HEADERS = new Set([
   'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-forwarded-port', 'x-real-ip', 'forwarded', 'via',
 ]);
 
-// 带 body 的请求最多缓冲 50MB，用于 307/308 重定向时重发（body 流只能读一次）；超大 body 不缓冲，遇 307/308 明确失败
+// 带 body 的请求最多缓冲 50MB，用于 307/308 重定向时重发（body 流只能读一次）
 const MAX_BUFFERED_BODY = 50 * 1024 * 1024;
+
+// 有上限的流式读取请求体：chunked（无 content-length，git 大 push 常见）也能防 OOM
+// 返回 null 表示超过上限（流已被消费，调用方必须立即终止请求）
+async function readBodyCapped(req, cap) {
+  if (!req.body) return new ArrayBuffer(0);
+  const reader = req.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      try { await reader.cancel(); } catch { /* 已断 */ }
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out.buffer;
+}
+
+// 逐跳头（HTTP 规范要求端到端转发时剔除，Worker 出站也不该带）
+const HOP_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade',
+]);
 
 async function proxy(req, target, cfg) {
   let url = target;
   let method = req.method;
 
   // 缓冲请求体：git push / LFS 的 307/308 场景需要重发 body。
-  // content-length 未知（chunked）时也缓冲；明确超过上限则不缓冲，遇 307/308 明确失败
+  // content-length 已知且超上限 → 不读，保持流式转发（遇 307/308 明确失败）；
+  // content-length 未知（chunked）或已知不超限 → 有上限流式读取，防内存耗尽
   let bodyBuf = null;
   if (method !== 'GET' && method !== 'HEAD') {
     const clen = Number(req.headers.get('content-length') || 0);
-    if (clen <= MAX_BUFFERED_BODY) {
-      try { bodyBuf = await req.arrayBuffer(); } catch { bodyBuf = null; }
+    if (clen > MAX_BUFFERED_BODY) {
+      bodyBuf = null; // 明确超限：不读，第一跳照常流式转发
+    } else {
+      bodyBuf = await readBodyCapped(req, MAX_BUFFERED_BODY);
+      if (bodyBuf === null) return new Response('request body too large', { status: 413 });
     }
   }
 
@@ -514,8 +562,12 @@ async function proxy(req, target, cfg) {
     }
 
     const h = new Headers();
+    // 方法切到 GET/HEAD 后必须剔除 body 相关门，否则上游可能挂起等 body 或回 400
+    const isBodyless = method === 'GET' || method === 'HEAD';
     for (const [k, v] of req.headers) {
-      if (STRIP_REQ_HEADERS.has(k.toLowerCase())) continue;
+      const lk = k.toLowerCase();
+      if (STRIP_REQ_HEADERS.has(lk) || HOP_HEADERS.has(lk)) continue;
+      if (isBodyless && (lk === 'content-length' || lk === 'content-type')) continue;
       h.set(k, v);
     }
     h.set('user-agent', UA);
@@ -550,6 +602,7 @@ async function proxy(req, target, cfg) {
     out.delete('content-security-policy-report-only');
     out.delete('clear-site-data');
     out.delete('set-cookie'); // 不把上游 Cookie 透传给客户端
+    for (const k of HOP_HEADERS) out.delete(k); // 逐跳头由运行时自行管理
 
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
@@ -618,7 +671,7 @@ async function handle(req, env) {
 
   // favicon：返回内联 SVG，避免 /favicon.ico 404
   if (path === '/favicon.ico' || path === '/favicon.svg') {
-    return new Response(FAVICON_SVG, { headers: { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'public, max-age=86400' } });
+    return new Response(FAVICON_SVG, { headers: { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' } });
   }
 
   // 老 gh-proxy 兼容：/?q=github.com/user/repo → 302 到反代路径（避免老链接 404）
@@ -685,6 +738,11 @@ async function handle(req, env) {
     if (await tokenValid(t, cfg)) hasToken = true;
   }
 
+  // 令牌无效/过期（首段形如令牌长度的一串十六进制但非当日令牌）：给明确提示，别让用户对着 404 猜
+  // 覆盖误用：截断（少几位）、多打字符（多几位）、大写
+  if (!hasToken && segs.length && /^[0-9a-f]{12,20}$/i.test(segs[0]) && !checkPath(rest)) {
+    return text('令牌无效或已过期（令牌每天 0 点自动轮换，请回首页重新生成链接）', 401);
+  }
   if (!checkPath(rest)) return text('Not Found', 404);
 
   // 配额（先预检两个额度，都通过才计数，避免只扣一半导致少放行）
@@ -705,6 +763,8 @@ async function handle(req, env) {
   sp.delete('t');
   const qs = sp.toString();
   const target = toFullUrl(rest) + (qs ? '?' + qs : '');
+  // 纵深防御：toFullUrl 结构上只会产出白名单主机，这里显式校验兜底（防未来改动引入回归）
+  if (!isAllowedHost(target)) return text('Not Found', 404);
   return proxy(req, target, cfg);
 }
 

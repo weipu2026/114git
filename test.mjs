@@ -218,6 +218,92 @@ let cookieVal = '';
   check('游客第 2 次超额 → 429', r2.status === 429, `status=${r2.status}`);
 }
 
+// ---------- 12.5 v1.3 修复回归：chunked body / 逐跳头 / 方法切换残留头 ----------
+{
+  // chunked（流式 body，无 content-length）小体积 → 正常缓冲并回源
+  mock200();
+  const small = new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('chunked-body-ok')); c.close(); },
+  });
+  const r = await worker.fetch(new Request(HOST + `/${TOKEN}/user/repo.git/git-upload-pack`, { method: 'POST', body: small, duplex: 'half' }), env);
+  check('chunked 小 body → 正常回源 200', r.status === 200 && calls.length === 1, `status=${r.status} calls=${calls.length}`);
+  const b = calls[0]?.body;
+  const txt = b instanceof ArrayBuffer ? new TextDecoder().decode(b) : String(b ?? '');
+  check('chunked body 内容完整', txt === 'chunked-body-ok', `got=${txt}`);
+}
+{
+  // chunked 超 50MB 上限 → 413 快速失败且不出站（防 OOM）
+  calls = []; respQueue.length = 0;
+  const big = new ReadableStream({
+    start(c) {
+      const chunk = new Uint8Array(5 * 1024 * 1024); // 5MB/块 × 11 块 = 55MB > 50MB
+      for (let i = 0; i < 11; i++) c.enqueue(chunk);
+      c.close();
+    },
+  });
+  const r = await worker.fetch(new Request(HOST + `/${TOKEN}/user/repo.git/git-upload-pack`, { method: 'POST', body: big, duplex: 'half' }), env);
+  check('chunked 超 50MB 上限 → 413 且不出站（防 OOM）', r.status === 413 && calls.length === 0, `status=${r.status} calls=${calls.length}`);
+}
+{
+  // 303 → 转 GET 后不得残留 content-length / content-type（上游会挂起或 400）
+  calls = []; respQueue.length = 0;
+  respQueue.push({ status: 303, headers: { location: 'https://github.com/after/303' } });
+  respQueue.push({ status: 200 });
+  await call('POST', `/${TOKEN}/user/repo.git/git-upload-pack`, { body: 'abc', headers: { 'content-type': 'application/x-git-upload-pack-request' } });
+  const h = calls[1]?.headers || {};
+  check('303 转 GET → 不残留 content-length/content-type',
+    calls[1]?.method === 'GET' && !h['content-length'] && !h['content-type'],
+    `method=${calls[1]?.method} cl=${h['content-length']} ct=${h['content-type']}`);
+}
+{
+  // 出站请求不携带逐跳头（即使客户端恶意传入）
+  mock200();
+  await call('GET', `/${TOKEN}/octocat/Hello-World/raw/master/README`, {
+    headers: { 'transfer-encoding': 'chunked', connection: 'keep-alive', upgrade: 'websocket' },
+  });
+  const h = calls[0]?.headers || {};
+  const leaked = ['transfer-encoding', 'connection', 'upgrade'].filter((k) => h[k]);
+  check('逐跳头不透传上游', leaked.length === 0, `leaked=${leaked.join(',')}`);
+}
+{
+  // 声明超限的 content-length → 不缓冲保持流式，307 后明确 502（不 OOM 不吊死）
+  calls = []; respQueue.length = 0;
+  respQueue.push({ status: 307, headers: { location: 'https://github.com/moved/pack' } });
+  const req = new Request(HOST + `/${TOKEN}/user/repo.git/git-upload-pack`, {
+    method: 'POST',
+    body: new Uint8Array(64),
+    headers: { 'content-length': String(51 * 1024 * 1024) },
+  });
+  const r = await worker.fetch(req, env);
+  check('声明超限 body → 第一跳放行', calls.length === 1, `calls=${calls.length}`);
+  check('声明超限 body + 307 → 502 明确失败', r.status === 502, `status=${r.status}`);
+}
+
+// ---------- 12.6 v1.3 修复回归：令牌形状提示 / 脏配置净化 ----------
+{
+  // 令牌被截断 / 多打一个字符 / 大写 → 401 明确提示（而不是干巴巴 404）
+  const bad = [TOKEN.slice(0, 15), TOKEN + '0', TOKEN.toUpperCase()];
+  let allOk = true, detail = '';
+  for (const t of bad) {
+    const res = await call('GET', `/${t}/user/repo/raw/main/a`, { env: { ...env, GUEST_IP_LIMIT: '0', GUEST_GLOBAL_LIMIT: '0' } });
+    const txt = await res.text();
+    if (res.status !== 401 || !txt.includes('令牌')) { allOk = false; detail += `[${t.slice(0, 8)}…→${res.status}]`; }
+  }
+  check('令牌形状异常 → 401 + 令牌轮换提示', allOk, detail);
+}
+{
+  // 脏配置 GUEST_IP_LIMIT=abc → 必须回退默认 50，而不是 NaN 静默无限放行
+  const e = { PASSWORD: 'p@ss', TOKEN_KEY: KEY, GUEST_IP_LIMIT: 'abc', GUEST_GLOBAL_LIMIT: 'abc' };
+  const ip = { 'cf-connecting-ip': '6.6.6.6' };
+  let first = 0, last = 0;
+  for (let i = 0; i < 55; i++) {
+    const r = await worker.fetch(new Request(`${HOST}/user/repo/raw/main/a`, { headers: ip }), e);
+    if (i === 0) first = r.status;
+    last = r.status;
+  }
+  check('脏配额配置回退默认（IP 50，第 51 次 429）', first === 200 && last === 429, `first=${first} last=${last}`);
+}
+
 // ---------- 13. 真实出站：git smart HTTP（网络抖动时跳过） ----------
 {
   globalThis.fetch = origFetch;
