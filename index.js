@@ -130,8 +130,16 @@ function todayStr() {
   return d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate());
 }
 
+// 令牌派生结果缓存：key 由 tokenKey + UTC 日期构成，跨日或换密钥自动失效。
+// （与 v1.2 移除的 _configCache 性质不同：那个无条件缓存首次 env，这里 key 覆盖全部输入）
+let _tokKey = '';
+let _tokVal = '';
 async function todayToken(cfg) {
-  return (await sha256Hex(cfg.tokenKey + '/' + todayStr())).slice(0, 16);
+  const key = cfg.tokenKey + '/' + todayStr();
+  if (key === _tokKey) return _tokVal;
+  _tokVal = (await sha256Hex(key)).slice(0, 16);
+  _tokKey = key;
+  return _tokVal;
 }
 
 async function tokenValid(t, cfg) {
@@ -499,6 +507,13 @@ const STRIP_REQ_HEADERS = new Set([
   'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker', 'cf-ew-via',
   'cdn-loop',
   'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-forwarded-port', 'x-real-ip', 'forwarded', 'via',
+  // Range 不能透传：raw.githubusercontent.com 对文本文件做动态 gzip，Range 请求会返回
+  // 「压缩流分片 + 以压缩后长度为总长」的 206（实测 cr=bytes 0-99/5203 而真实文件 15295），
+  // CF 运行时处理后开头分片变空、中段分片客户端无法解压 → 静默产生损坏文件。
+  // 剥离后客户端退化为 200 完整下载：正确优先，代价是失去断点续传。
+  'range', 'if-range',
+  // Referer 的路径部分含令牌（本反代把令牌放在路径首段），透传等于把令牌交给上游
+  'referer',
 ]);
 
 // 带 body 的请求最多缓冲 50MB，用于 307/308 重定向时重发（body 流只能读一次）
@@ -598,6 +613,8 @@ async function proxy(req, target, cfg) {
     const out = new Headers(res.headers);
     if (!out.has('access-control-allow-origin')) out.set('access-control-allow-origin', '*');
     out.set('x-content-type-options', 'nosniff');
+    // 令牌在 URL 路径首段，响应统一禁 Referer，避免令牌随页面跳转/外链外泄
+    out.set('referrer-policy', 'no-referrer');
     out.delete('content-security-policy');
     out.delete('content-security-policy-report-only');
     out.delete('clear-site-data');
@@ -607,7 +624,11 @@ async function proxy(req, target, cfg) {
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
       if (!loc) return new Response(res.body, { status: res.status, headers: out });
-      const abs = new URL(loc, url).href;
+      let abs;
+      try { abs = new URL(loc, url).href; } catch { return text('proxy error', 502); }
+      // 只允许 http/https：杜绝 javascript: / data: 等 scheme 被原样透传给浏览器
+      // （当前不可利用——Location 由 GitHub 决定，攻击者无法控制上游响应；属纵深防御）
+      if (!/^https?:\/\//i.test(abs)) return text('proxy error: unsupported redirect', 502);
       if (!isAllowedHost(abs)) {
         // 外部跳转：交给浏览器自己跟（仅重写一次到目标）
         out.set('location', abs);

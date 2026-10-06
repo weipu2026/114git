@@ -22,9 +22,11 @@ const d = new Date();
 const today = d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCDate()).padStart(2, '0');
 const TOKEN = (await sha256Hex(KEY + '/' + today)).slice(0, 16);
 
+// opts 可传 env 覆盖本次请求的配置（其余字段透传给 Request）
 async function call(method, path, opts = {}) {
-  const req = new Request(HOST + path, { method, redirect: 'manual', ...opts });
-  return worker.fetch(req, env);
+  const { env: envOverride, ...rest } = opts;
+  const req = new Request(HOST + path, { method, redirect: 'manual', ...rest });
+  return worker.fetch(req, envOverride || env);
 }
 
 // ---------- mock 出站 ----------
@@ -302,6 +304,73 @@ let cookieVal = '';
     last = r.status;
   }
   check('脏配额配置回退默认（IP 50，第 51 次 429）', first === 200 && last === 429, `first=${first} last=${last}`);
+}
+
+// ---------- 12.7 v1.4 修复回归：Range 剥离 / 令牌缓存 / referer / Location scheme ----------
+{
+  // P1：range 绝不能出站。上游 raw 对文本文件动态 gzip，Range 会返回「压缩流分片 + 压缩后总长」的 206，
+  // CF 运行时处理后开头分片变空、中段分片客户端无法解压 → 静默产生损坏文件。
+  mock200();
+  const res = await call('GET', `/${TOKEN}/user/repo/raw/main/a`, {
+    headers: { range: 'bytes=0-99', 'if-range': 'W/"etag"' },
+  });
+  const outH = calls[0]?.headers || {};
+  check('P1 range/if-range 不透传出站', !('range' in outH) && !('if-range' in outH), `出站头: ${Object.keys(outH).join(',')}`);
+  check('P1 客户端 Range 请求退化为 200 完整下载（不回 206）', res.status === 200, `status=${res.status}`);
+  check('P1 响应无 content-range（不会误导客户端按分片处理）', !res.headers.get('content-range'), res.headers.get('content-range') || '');
+}
+{
+  // P2：令牌派生结果按「密钥+日期」缓存 —— 换密钥重算 1 次，同密钥后续请求 0 次
+  const origDigest = crypto.subtle.digest.bind(crypto.subtle);
+  const KEY2 = 'y'.repeat(40);
+  const env2 = { PASSWORD: 'p@ss', TOKEN_KEY: KEY2 };
+  const TOKEN2 = (await sha256Hex(KEY2 + '/' + today)).slice(0, 16);
+  let n = 0;
+  crypto.subtle.digest = async (...a) => { n++; return origDigest(...a); };
+  mock200();
+  await call('GET', `/${TOKEN2}/user/repo/raw/main/a`, { env: env2 });
+  const firstN = n;
+  mock200();
+  await call('GET', `/${TOKEN2}/user/repo/raw/main/b`, { env: env2 });
+  const secondN = n - firstN;
+  crypto.subtle.digest = origDigest;
+  check('P2 令牌缓存：换密钥算 1 次 SHA-256', firstN === 1, `first=${firstN}`);
+  check('P2 令牌缓存：同密钥复用缓存，再请求 0 次 SHA-256', secondN === 0, `second=${secondN}`);
+}
+{
+  // P2 缓存不能串味：A 密钥的令牌不能因为 B 密钥算过就命中
+  const envA = { PASSWORD: 'p@ss', TOKEN_KEY: 'z'.repeat(40) };
+  const TOKENA = (await sha256Hex('z'.repeat(40) + '/' + today)).slice(0, 16);
+  mock200();
+  const r = await call('GET', `/${TOKENA}/user/repo/raw/main/a`, { env: envA });
+  check('P2 缓存按密钥隔离（换 env 仍能正确鉴权放行）', r.status === 200, `status=${r.status}`);
+}
+{
+  // P3：referer 不出站（路径里含令牌），且响应统一禁 Referer
+  mock200();
+  await call('GET', `/${TOKEN}/user/repo/raw/main/a`, { headers: { referer: `https://git.test/${TOKEN}/secret/path` } });
+  check('P3 referer 不透传出站（防令牌随 Referer 交给上游）', !('referer' in (calls[0]?.headers || {})),
+    JSON.stringify(calls[0]?.headers?.referer || ''));
+  mock200();
+  const res = await call('GET', `/${TOKEN}/user/repo/raw/main/b`);
+  check('P3 代理响应带 referrer-policy: no-referrer', res.headers.get('referrer-policy') === 'no-referrer',
+    String(res.headers.get('referrer-policy')));
+}
+{
+  // P3：Location 只允许 http/https，杜绝 javascript:/data: 被原样透传给浏览器
+  for (const [loc, label] of [['javascript:alert(1)', 'javascript:'], ['data:text/html,<script>x</script>', 'data:']]) {
+    calls = []; respQueue.length = 0;
+    respQueue.push({ status: 302, headers: { location: loc } });
+    const res = await call('GET', `/${TOKEN}/user/repo/raw/main/a`);
+    check(`P3 Location ${label} 被拒（502 且不透传 location）`,
+      res.status === 502 && !res.headers.get('location'), `status=${res.status} loc=${res.headers.get('location')}`);
+  }
+  // 协议相对外链仍应透传（设计内：外部跳转交浏览器自己跟）
+  calls = []; respQueue.length = 0;
+  respQueue.push({ status: 302, headers: { location: '//evil.example.com/x' } });
+  const res = await call('GET', `/${TOKEN}/user/repo/raw/main/a`);
+  check('P3 协议相对外链仍透传给浏览器（设计内行为未变）',
+    res.headers.get('location') === 'https://evil.example.com/x', String(res.headers.get('location')));
 }
 
 // ---------- 13. 真实出站：git smart HTTP（网络抖动时跳过） ----------

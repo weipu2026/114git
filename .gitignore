@@ -10,5 +10,17 @@ node_modules/
 # 本地 UI 预览文件（无需进仓库，部署只靠 index.js）
 preview-*.html
 
+# 本地测试/探针工具（含线上站点地址与探测逻辑，不属于部署产物）
+.e2e-*.mjs
+.fuzz.mjs
+.audit-probe.mjs
+.verify-probe.mjs
+.init-probe.mjs
+.perf-probe.mjs
+.patch-*.mjs
+.mut.mjs
+*.bak
+.clone-*/
+
 # 系统文件
 .DS_Store
